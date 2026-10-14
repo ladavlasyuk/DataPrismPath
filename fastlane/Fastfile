@@ -1,0 +1,134 @@
+require 'spaceship'
+
+# -----------------------------
+
+
+APP_IDENTIFIER = "com.PrismPathLightPuzzle"
+
+
+# -----------------------------
+
+
+API_KEY_PATH   = ENV["APP_STORE_CONNECT_API_KEY_PATH"]
+
+default_platform(:ios)
+
+platform :ios do
+
+  desc "Update metadata (deliver)"
+  lane :upload_metadata do
+    deliver(
+      app_identifier: APP_IDENTIFIER,
+      skip_binary_upload: true,
+      skip_metadata: false,
+      force: true,
+      metadata_path: "./fastlane/metadata",
+      skip_screenshots: false,
+      overwrite_screenshots: true,
+	  screenshots_path: "./fastlane/screenshots_temp",
+      api_key_path: API_KEY_PATH
+    )
+  end
+
+  desc "Upload screenshots sequentially via Spaceship (auto count)"
+  lane :upload_screenshots_sequential do
+
+    UI.user_error!("API Key path not found. Add APP_STORE_CONNECT_API_KEY_PATH in Bitrise.") unless API_KEY_PATH
+
+    # Авторизация через API Key
+    api_key = Spaceship::ConnectAPI::Token.from_json_file(API_KEY_PATH)
+    Spaceship::ConnectAPI.token = api_key
+
+    screenshots_root = File.join(ENV["BITRISE_SOURCE_DIR"], "fastlane", "screenshots")
+    UI.user_error!("Screenshots folder not found at #{screenshots_root}") unless Dir.exist?(screenshots_root)
+
+    app = Spaceship::ConnectAPI::App.find(APP_IDENTIFIER)
+    UI.user_error!("App not found: #{APP_IDENTIFIER}") unless app
+
+    version = app.get_edit_app_store_version
+    UI.user_error!("No editable App Store version found") unless version
+
+    localizations = version.get_app_store_version_localizations
+    device_type = "APP_IPHONE_65"
+
+    locales = Dir.children(screenshots_root).select do |loc|
+      File.directory?(File.join(screenshots_root, loc))
+    end
+
+    # -----------------------------
+    # Авто-определение максимального номера скриншота
+    # -----------------------------
+    max_index = 0
+
+    locales.each do |locale|
+      files = Dir.glob(File.join(screenshots_root, locale, "*.{png,PNG,jpg,JPG,jpeg,JPEG}"))
+      next if files.empty?
+
+      files.each do |f|
+        num = File.basename(f).split(".").first.to_i
+        max_index = num if num > max_index
+      end
+    end
+
+    UI.message("Detected max screenshot index: #{max_index}")
+
+    # -----------------------------
+    # Загрузка поочереди 1..max_index
+    # -----------------------------
+    (1..max_index).each do |index|
+      locales.each do |locale|
+        locale_path = File.join(screenshots_root, locale)
+        file_path = File.join(locale_path, "#{index}.png")
+
+        next unless File.exist?(file_path)
+
+        UI.header("Locale: #{locale} | Uploading #{index}.png")
+
+        localization = localizations.find { |l| l.locale == locale }
+        unless localization
+          UI.important("Locale #{locale} not found in ASC, skipping")
+          next
+        end
+
+        screenshot_sets = localization.get_app_screenshot_sets
+        screenshot_set = screenshot_sets.find { |s| s.screenshot_display_type == device_type }
+
+        unless screenshot_set
+          UI.important("Device type #{device_type} not found for locale #{locale}, skipping")
+          next
+        end
+
+        screenshot_set = Spaceship::ConnectAPI::AppScreenshotSet.get(
+          app_screenshot_set_id: screenshot_set.id,
+          includes: "appScreenshots"
+        )
+
+        if index == 1
+          UI.message("Deleting existing screenshots for #{locale}...")
+          (screenshot_set.app_screenshots || []).each(&:delete!)
+        end
+
+        UI.message("Uploading #{file_path}")
+        screenshot_set.upload_screenshot(path: file_path)
+
+        sleep(2)
+      end
+    end
+
+    UI.success("All screenshots uploaded sequentially 🎉")
+  end
+
+  desc "Upload metadata + screenshots"
+  lane :upload_all do
+    upload_metadata
+    upload_screenshots_sequential
+  end
+
+  # -----------------------------
+  # Bitrise Autoconfig friendly lane
+  # -----------------------------
+  desc "Default lane for Bitrise (autoconfig)"
+  lane :deploy do
+    upload_all
+  end
+end
